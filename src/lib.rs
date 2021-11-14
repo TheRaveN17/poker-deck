@@ -12,7 +12,7 @@ enum Suit {
     Spades,
 }
 
-#[derive(Clone, Copy, Debug, EnumIter, Eq, Ord, PartialEq, PartialOrd)]
+#[derive(Clone, Copy, Debug, EnumIter, Hash, Eq, Ord, PartialEq, PartialOrd)]
 enum Rank {
     Two,
     Three,
@@ -71,13 +71,13 @@ impl Rank {
 #[derive(Debug, PartialEq, Eq, PartialOrd)]
 enum HandRanking {
     HighCard(u16),
-    Pair,
-    TwoPair,
-    Set,
+    OnePair(Rank, u16),
+    TwoPair(Rank, Rank, Rank),
+    Set(Rank, u16),
     Straight(Rank),
     Flush(u16),
-    FullHouse,
-    Quads,
+    FullHouse(Rank, Rank),
+    Quads(Rank, Rank),
     StraightFlush(Rank),
     RoyalFlush,
 }
@@ -256,68 +256,61 @@ impl Hand {
         }
     }
 
+    fn check_quads(&self) -> Option<HandRanking> {
+        let mut map = HashMap::with_capacity(7);
+        let mut bitmask: u16 = 0x00;
+        let mut pair: Vec<Rank> = Vec::with_capacity(3);
+        let mut set: Vec<Rank> = Vec::with_capacity(2);
+
+        for card in &self.cards {
+            let count = map.entry(card.rank).or_insert(0);
+            *count += 1;
+            bitmask |= 1 << card.score();
+        }
+
+        for (card, count) in map {
+            match count {
+                2 => pair.push(card),
+                3 => set.push(card),
+                4 => {
+                    bitmask ^= 1 << card.score(); // unset quads bit
+                    let id = (bitmask as f64).log2() as u8; // find most significant bit
+                    return Some(HandRanking::Quads(card, Rank::id(id)));
+                }
+                _ => (),
+            }
+        }
+
+        if set.len() == 2 {
+            set.sort();
+            set.reverse();
+            return Some(HandRanking::FullHouse(set[0], set[1]));
+        } else if set.len() == 1 {
+            if !pair.is_empty() {
+                pair.sort();
+                pair.reverse();
+                return Some(HandRanking::FullHouse(set[0], pair[0]));
+            } else {
+                return Some(HandRanking::Set(set[0], bitmask));
+            }
+        }
+
+        if pair.len() > 1 {
+            pair.sort();
+            pair.reverse();
+            bitmask ^= 1 << pair[0].score(); // unset pair1 bit
+            bitmask ^= 1 << pair[1].score(); // unset pair2 bit
+            let id = (bitmask as f64).log2() as u8; // find most significant bit
+            return Some(HandRanking::TwoPair(pair[0], pair[1], Rank::id(id)));
+        } else if !pair.is_empty() {
+            return Some(HandRanking::OnePair(pair[0], bitmask));
+        }
+
+        Some(HandRanking::HighCard(bitmask))
+    }
+
     pub fn display(&self) {
         println!("Hand is {:?}", self.cards)
-    }
-}
-
-pub struct Table {
-    players: Vec<Player>,
-    pot: usize,
-    deck: Deck,
-    board: Vec<Card>,
-}
-
-impl Table {
-    pub fn new() -> Table {
-        let deck = Deck::new();
-        let pot = 0;
-        let players = Vec::with_capacity(10);
-        let board = Vec::with_capacity(5);
-
-        Table {
-            players,
-            pot,
-            deck,
-            board,
-        }
-    }
-
-    pub fn add_player(&mut self, name: String, cash: usize) {
-        self.players.push(Player::new(name, cash));
-    }
-
-    pub fn new_round(&mut self) {
-        println!("Starting a new round...");
-        self.reset();
-        // self.preflop();
-    }
-
-    // fn preflop(&mut self) {
-    //     for player in self.players {
-    //         player.cards.extend(self.deck.draw(2));
-    //     }
-    // }
-
-    fn reset(&mut self) {
-        self.deck.reset();
-        self.deck.shuffle();
-        self.pot = 0;
-        self.board.clear();
-    }
-}
-
-struct Player {
-    name: String,
-    cash: usize,
-    cards: Vec<Card>,
-}
-
-impl Player {
-    fn new(name: String, cash: usize) -> Player {
-        let cards = Vec::with_capacity(2);
-
-        Player { name, cash, cards }
     }
 }
 
@@ -333,6 +326,29 @@ mod tests {
         );
         assert!(HandRanking::RoyalFlush > HandRanking::StraightFlush(Rank::King));
         assert!(HandRanking::Straight(Rank::Queen) > HandRanking::Straight(Rank::Jack));
+        assert!(
+            HandRanking::Quads(Rank::Queen, Rank::Jack)
+                < HandRanking::Quads(Rank::Queen, Rank::King)
+        );
+        assert!(
+            HandRanking::FullHouse(Rank::King, Rank::Two)
+                > HandRanking::FullHouse(Rank::Two, Rank::Seven)
+        );
+        assert!(
+            HandRanking::Set(Rank::Two, 0b10_0001_1010_0010)
+                < HandRanking::Set(Rank::Three, 0b01_0001_1010_0010)
+        );
+        assert!(
+            HandRanking::TwoPair(Rank::Ace, Rank::Eight, Rank::Six)
+                > HandRanking::TwoPair(Rank::Ace, Rank::Eight, Rank::Five)
+        );
+        assert!(
+            HandRanking::OnePair(Rank::Ace, 0b10_0001_1010_1100)
+                < HandRanking::OnePair(Rank::Ace, 0b10_0010_1010_1100)
+        );
+        assert!(
+            HandRanking::HighCard(0b10_0001_1010_1100) < HandRanking::HighCard(0b10_0010_1010_1100)
+        );
     }
 
     #[test]
@@ -416,6 +432,300 @@ mod tests {
         assert_eq!(
             hand.check_straight(None),
             Some(HandRanking::Straight(Rank::Five))
+        );
+    }
+
+    #[test]
+    fn check_quads() {
+        let hole = [
+            Card {
+                rank: Rank::King,
+                suit: Suit::Hearts,
+            },
+            Card {
+                rank: Rank::King,
+                suit: Suit::Clubs,
+            },
+        ];
+        let board = [
+            Card {
+                rank: Rank::King,
+                suit: Suit::Diamonds,
+            },
+            Card {
+                rank: Rank::King,
+                suit: Suit::Spades,
+            },
+            Card {
+                rank: Rank::Nine,
+                suit: Suit::Hearts,
+            },
+            Card {
+                rank: Rank::Two,
+                suit: Suit::Hearts,
+            },
+            Card {
+                rank: Rank::Nine,
+                suit: Suit::Clubs,
+            },
+        ];
+
+        let hand = Hand::new(&hole, &board);
+        assert_eq!(
+            hand.check_quads(),
+            Some(HandRanking::Quads(Rank::King, Rank::Nine))
+        );
+    }
+
+    #[test]
+    fn check_full_house_two_sets() {
+        let hole = [
+            Card {
+                rank: Rank::Two,
+                suit: Suit::Hearts,
+            },
+            Card {
+                rank: Rank::Two,
+                suit: Suit::Clubs,
+            },
+        ];
+        let board = [
+            Card {
+                rank: Rank::King,
+                suit: Suit::Diamonds,
+            },
+            Card {
+                rank: Rank::Two,
+                suit: Suit::Spades,
+            },
+            Card {
+                rank: Rank::King,
+                suit: Suit::Hearts,
+            },
+            Card {
+                rank: Rank::King,
+                suit: Suit::Clubs,
+            },
+            Card {
+                rank: Rank::Nine,
+                suit: Suit::Clubs,
+            },
+        ];
+
+        let hand = Hand::new(&hole, &board);
+        assert_eq!(
+            hand.check_quads(),
+            Some(HandRanking::FullHouse(Rank::King, Rank::Two))
+        );
+    }
+
+    #[test]
+    fn check_full_house_set_and_pairs() {
+        let hole = [
+            Card {
+                rank: Rank::Two,
+                suit: Suit::Hearts,
+            },
+            Card {
+                rank: Rank::Two,
+                suit: Suit::Clubs,
+            },
+        ];
+        let board = [
+            Card {
+                rank: Rank::Six,
+                suit: Suit::Diamonds,
+            },
+            Card {
+                rank: Rank::Two,
+                suit: Suit::Spades,
+            },
+            Card {
+                rank: Rank::Six,
+                suit: Suit::Hearts,
+            },
+            Card {
+                rank: Rank::Seven,
+                suit: Suit::Clubs,
+            },
+            Card {
+                rank: Rank::Seven,
+                suit: Suit::Spades,
+            },
+        ];
+
+        let hand = Hand::new(&hole, &board);
+        assert_eq!(
+            hand.check_quads(),
+            Some(HandRanking::FullHouse(Rank::Two, Rank::Seven))
+        );
+    }
+
+    #[test]
+    fn check_set() {
+        let hole = [
+            Card {
+                rank: Rank::Two,
+                suit: Suit::Hearts,
+            },
+            Card {
+                rank: Rank::Two,
+                suit: Suit::Clubs,
+            },
+        ];
+        let board = [
+            Card {
+                rank: Rank::Six,
+                suit: Suit::Diamonds,
+            },
+            Card {
+                rank: Rank::Two,
+                suit: Suit::Spades,
+            },
+            Card {
+                rank: Rank::Eight,
+                suit: Suit::Hearts,
+            },
+            Card {
+                rank: Rank::Nine,
+                suit: Suit::Clubs,
+            },
+            Card {
+                rank: Rank::King,
+                suit: Suit::Spades,
+            },
+        ];
+
+        let hand = Hand::new(&hole, &board);
+        assert_eq!(
+            hand.check_quads(),
+            Some(HandRanking::Set(Rank::Two, 0b01_0001_1010_0010))
+        );
+    }
+
+    #[test]
+    fn check_two_pair() {
+        let hole = [
+            Card {
+                rank: Rank::Ace,
+                suit: Suit::Hearts,
+            },
+            Card {
+                rank: Rank::Ace,
+                suit: Suit::Clubs,
+            },
+        ];
+        let board = [
+            Card {
+                rank: Rank::Six,
+                suit: Suit::Diamonds,
+            },
+            Card {
+                rank: Rank::Six,
+                suit: Suit::Spades,
+            },
+            Card {
+                rank: Rank::Eight,
+                suit: Suit::Hearts,
+            },
+            Card {
+                rank: Rank::Eight,
+                suit: Suit::Clubs,
+            },
+            Card {
+                rank: Rank::Three,
+                suit: Suit::Spades,
+            },
+        ];
+
+        let hand = Hand::new(&hole, &board);
+        assert_eq!(
+            hand.check_quads(),
+            Some(HandRanking::TwoPair(Rank::Ace, Rank::Eight, Rank::Six))
+        );
+    }
+
+    #[test]
+    fn check_one_pair() {
+        let hole = [
+            Card {
+                rank: Rank::Ace,
+                suit: Suit::Hearts,
+            },
+            Card {
+                rank: Rank::Nine,
+                suit: Suit::Clubs,
+            },
+        ];
+        let board = [
+            Card {
+                rank: Rank::Ace,
+                suit: Suit::Diamonds,
+            },
+            Card {
+                rank: Rank::Six,
+                suit: Suit::Spades,
+            },
+            Card {
+                rank: Rank::Eight,
+                suit: Suit::Hearts,
+            },
+            Card {
+                rank: Rank::Four,
+                suit: Suit::Clubs,
+            },
+            Card {
+                rank: Rank::Three,
+                suit: Suit::Spades,
+            },
+        ];
+
+        let hand = Hand::new(&hole, &board);
+        assert_eq!(
+            hand.check_quads(),
+            Some(HandRanking::OnePair(Rank::Ace, 0b10_0001_1010_1100))
+        );
+    }
+
+    #[test]
+    fn check_high_card() {
+        let hole = [
+            Card {
+                rank: Rank::Ace,
+                suit: Suit::Hearts,
+            },
+            Card {
+                rank: Rank::Nine,
+                suit: Suit::Clubs,
+            },
+        ];
+        let board = [
+            Card {
+                rank: Rank::King,
+                suit: Suit::Diamonds,
+            },
+            Card {
+                rank: Rank::Six,
+                suit: Suit::Spades,
+            },
+            Card {
+                rank: Rank::Eight,
+                suit: Suit::Hearts,
+            },
+            Card {
+                rank: Rank::Four,
+                suit: Suit::Clubs,
+            },
+            Card {
+                rank: Rank::Three,
+                suit: Suit::Spades,
+            },
+        ];
+
+        let hand = Hand::new(&hole, &board);
+        assert_eq!(
+            hand.check_quads(),
+            Some(HandRanking::HighCard(0b11_0001_1010_1100))
         );
     }
 }
