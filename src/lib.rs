@@ -159,50 +159,77 @@ impl Default for Deck {
 #[derive(Debug)]
 pub struct Hand {
     cards: Vec<Card>,
+    bitmask: u16,
+    suit_map: HashMap<Suit, u8>,
+    rank_map: HashMap<Rank, u8>,
 }
 
 impl Hand {
     pub fn new(hole_cards: &[Card], board_cards: &[Card]) -> Hand {
-        let mut cards = Vec::with_capacity(7);
+        let mut cards: Vec<Card> = Vec::with_capacity(7);
+        let mut suit_map = HashMap::with_capacity(4);
+        let mut rank_map = HashMap::with_capacity(7);
+        let mut bitmask: u16 = 0x00;
+
         cards.extend(hole_cards);
         cards.extend(board_cards);
 
-        // Sort cards from highest(Ace) to lowest(Two) so that
-        // check_flush and check_straight may work as intended.
-        cards.sort();
-        cards.reverse();
+        for card in &cards {
+            let count = suit_map.entry(card.suit).or_insert(0);
+            *count += 1;
 
-        Hand { cards }
+            let count = rank_map.entry(card.rank).or_insert(0);
+            *count += 1;
+
+            bitmask |= 1 << card.score();
+            if card.score() == 13 {
+                // If Ace also set bit 1
+                bitmask |= 0x01;
+            }
+        }
+
+        Hand {
+            cards,
+            bitmask,
+            suit_map,
+            rank_map,
+        }
     }
 
     fn check_flush(&self) -> Option<HandRanking> {
-        let mut map = HashMap::with_capacity(4);
         let mut flush_suit: Option<Suit> = None;
 
-        for card in &self.cards {
-            let count = map.entry(card.suit).or_insert(0);
-            *count += 1;
-
-            if *count == 5 {
-                flush_suit = Some(card.suit);
+        for (suit, count) in &self.suit_map {
+            if *count >= 5 {
+                flush_suit = Some(*suit);
                 break;
             }
         }
 
         if let Some(suit) = flush_suit {
-            let mut flush_cards = Vec::with_capacity(7);
+            // For flush cards
             let mut bitmask = 0x00;
 
             for card in &self.cards {
                 if card.suit == suit {
-                    flush_cards.push(*card);
                     bitmask |= 1 << card.score();
+
+                    // Also set bit 1 if Ace
+                    if card.score() == 13 {
+                        bitmask |= 0x01;
+                    }
                 }
             }
 
-            if let Some(result) = self.check_straight(Some(&flush_cards)) {
-                Some(result)
+            if let Some(card) = self.best_straight(bitmask) {
+                if card == Rank::Ace {
+                    Some(HandRanking::RoyalFlush)
+                } else {
+                    Some(HandRanking::StraightFlush(card))
+                }
             } else {
+                bitmask = self.highcards(bitmask, 5);
+
                 Some(HandRanking::Flush(bitmask))
             }
         } else {
@@ -210,103 +237,129 @@ impl Hand {
         }
     }
 
-    fn check_straight(&self, flush_cards: Option<&Vec<Card>>) -> Option<HandRanking> {
-        let mut index: Option<u8> = None;
-        let mut bitmask: u16 = 0x00;
-        let mut cards: &Vec<Card> = &self.cards;
-        let flush: bool;
-
-        if let Some(i) = flush_cards {
-            cards = i;
-            flush = true;
-        } else {
-            flush = false;
-        }
-
-        for card in cards {
-            if card.score() == 13 {
-                // If Ace also set bit 1
-                bitmask |= 0x01;
-            }
-            bitmask |= 1 << card.score();
-        }
+    // Returns the high card rank of the best possible straight, None if no straight found
+    fn best_straight(&self, bitmask: u16) -> Option<Rank> {
+        let mut card: Option<Rank> = None;
 
         // There are ten possible straights, check from highest to lowest
         for i in (0..10).rev() {
             if bitmask & 0x1F << i == 0x1F << i {
-                index = Some(i + 4);
+                card = Some(Rank::id(i + 4));
                 break;
             }
         }
 
-        if let Some(score) = index {
-            let card = Rank::id(score);
-
-            if flush {
-                if card == Rank::Ace {
-                    Some(HandRanking::RoyalFlush)
-                } else {
-                    Some(HandRanking::StraightFlush(card))
-                }
-            } else {
-                Some(HandRanking::Straight(card))
-            }
-        } else {
-            None
-        }
+        card
     }
 
-    fn check_quads(&self) -> Option<HandRanking> {
-        let mut map = HashMap::with_capacity(7);
-        let mut bitmask: u16 = 0x00;
+    // Get bitmask representation of the high cards to be used in HandRanking
+    fn highcards(&self, mut bitmask: u16, bits_needed: u8) -> u16 {
+        // Make sure bit 1 is unset
+        bitmask &= !0x01;
+
+        let mut bits_set = self.bits_set(bitmask);
+
+        while bits_set > bits_needed {
+            bitmask &= bitmask - 1; // Unset lsb
+            bits_set -= 1;
+        }
+
+        bitmask
+    }
+
+    // Count number of bits that are set in bitmask
+    fn bits_set(&self, mut bitmask: u16) -> u8 {
+        let mut count = 0;
+
+        while bitmask != 0 {
+            bitmask &= bitmask - 1;
+            count += 1;
+        }
+
+        count
+    }
+
+    fn best(&self) -> HandRanking {
         let mut pair: Vec<Rank> = Vec::with_capacity(3);
         let mut set: Vec<Rank> = Vec::with_capacity(2);
 
-        for card in &self.cards {
-            let count = map.entry(card.rank).or_insert(0);
-            *count += 1;
-            bitmask |= 1 << card.score();
-        }
-
-        for (card, count) in map {
+        for (card, count) in &self.rank_map {
             match count {
-                2 => pair.push(card),
-                3 => set.push(card),
+                2 => pair.push(*card),
+                3 => set.push(*card),
+
+                // Check for Quads
                 4 => {
-                    bitmask ^= 1 << card.score(); // unset quads bit
-                    let id = (bitmask as f64).log2() as u8; // find most significant bit
-                    return Some(HandRanking::Quads(card, Rank::id(id)));
+                    let bitmask = self.bitmask ^ 1 << card.score(); // Unset quads bit
+                    let id = (bitmask as f64).log2() as u8; // Find most significant bit
+
+                    return HandRanking::Quads(*card, Rank::id(id));
                 }
                 _ => (),
             }
         }
 
+        // Check for FullHouse
         if set.len() == 2 {
             set.sort();
             set.reverse();
-            return Some(HandRanking::FullHouse(set[0], set[1]));
-        } else if set.len() == 1 {
-            if !pair.is_empty() {
-                pair.sort();
-                pair.reverse();
-                return Some(HandRanking::FullHouse(set[0], pair[0]));
-            } else {
-                return Some(HandRanking::Set(set[0], bitmask));
-            }
+
+            return HandRanking::FullHouse(set[0], set[1]);
+        }
+        if set.len() == 1 && !pair.is_empty() {
+            pair.sort();
+            pair.reverse();
+
+            return HandRanking::FullHouse(set[0], pair[0]);
         }
 
+        // Check for Flush and StraightFlush
+        if let Some(flush) = self.check_flush() {
+            return flush;
+        }
+
+        // Check for Straight
+        if let Some(card) = self.best_straight(self.bitmask) {
+            return HandRanking::Straight(card);
+        }
+
+        // Make sure bit 1 is unset, as it is no longer needed
+        let mut bitmask = self.bitmask;
+
+        // Check for Set
+        if set.len() == 1 {
+            bitmask ^= 1 << set[0].score(); // Unset set1 bit
+
+            bitmask = self.highcards(bitmask, 2); // Two high cards
+
+            return HandRanking::Set(set[0], bitmask);
+        }
+
+        // Check for TwoPair
         if pair.len() > 1 {
             pair.sort();
             pair.reverse();
-            bitmask ^= 1 << pair[0].score(); // unset pair1 bit
-            bitmask ^= 1 << pair[1].score(); // unset pair2 bit
-            let id = (bitmask as f64).log2() as u8; // find most significant bit
-            return Some(HandRanking::TwoPair(pair[0], pair[1], Rank::id(id)));
-        } else if !pair.is_empty() {
-            return Some(HandRanking::OnePair(pair[0], bitmask));
+
+            bitmask ^= 1 << pair[0].score(); // Unset pair1 bit
+            bitmask ^= 1 << pair[1].score(); // Unset pair2 bit
+            let id = (bitmask as f64).log2() as u8; // Find most significant bit
+
+            return HandRanking::TwoPair(pair[0], pair[1], Rank::id(id));
         }
 
-        Some(HandRanking::HighCard(bitmask))
+        // Check for OnePair
+        if !pair.is_empty() {
+            bitmask ^= 1 << pair[0].score(); // Unset pair1 bit
+
+            bitmask = self.highcards(bitmask, 3); // Three high cards
+
+            return HandRanking::OnePair(pair[0], bitmask);
+        }
+
+        // None of the above means HighCard
+        bitmask = self.highcards(bitmask, 5); // Five high cards
+
+        HandRanking::HighCard(bitmask)
     }
 
     pub fn display(&self) {
@@ -389,8 +442,112 @@ mod tests {
         let hand = Hand::new(&hole, &board);
         assert_eq!(
             hand.check_flush(),
-            Some(HandRanking::Flush(0b01_0001_1101_0010))
+            Some(HandRanking::Flush(0b01_0001_1101_0000))
         );
+    }
+
+    #[test]
+    fn check_flush_ranking() {
+        let hole1 = [
+            Card {
+                rank: Rank::Seven,
+                suit: Suit::Hearts,
+            },
+            Card {
+                rank: Rank::Eight,
+                suit: Suit::Hearts,
+            },
+        ];
+        let hole2 = [
+            Card {
+                rank: Rank::Six,
+                suit: Suit::Hearts,
+            },
+            Card {
+                rank: Rank::Five,
+                suit: Suit::Hearts,
+            },
+        ];
+        let board = [
+            Card {
+                rank: Rank::King,
+                suit: Suit::Hearts,
+            },
+            Card {
+                rank: Rank::Queen,
+                suit: Suit::Hearts,
+            },
+            Card {
+                rank: Rank::Ace,
+                suit: Suit::Hearts,
+            },
+            Card {
+                rank: Rank::Jack,
+                suit: Suit::Hearts,
+            },
+            Card {
+                rank: Rank::Nine,
+                suit: Suit::Hearts,
+            },
+        ];
+
+        let hand1 = Hand::new(&hole1, &board);
+        let hand2 = Hand::new(&hole2, &board);
+        assert_eq!(hand1.check_flush(), hand2.check_flush());
+    }
+
+    #[test]
+    fn check_straight_flush() {
+        let hole1 = [
+            Card {
+                rank: Rank::Two,
+                suit: Suit::Hearts,
+            },
+            Card {
+                rank: Rank::Three,
+                suit: Suit::Hearts,
+            },
+        ];
+        let hole2 = [
+            Card {
+                rank: Rank::Ten,
+                suit: Suit::Hearts,
+            },
+            Card {
+                rank: Rank::Jack,
+                suit: Suit::Hearts,
+            },
+        ];
+        let board = [
+            Card {
+                rank: Rank::King,
+                suit: Suit::Hearts,
+            },
+            Card {
+                rank: Rank::Five,
+                suit: Suit::Hearts,
+            },
+            Card {
+                rank: Rank::Four,
+                suit: Suit::Hearts,
+            },
+            Card {
+                rank: Rank::Ace,
+                suit: Suit::Hearts,
+            },
+            Card {
+                rank: Rank::Queen,
+                suit: Suit::Hearts,
+            },
+        ];
+
+        let hand1 = Hand::new(&hole1, &board);
+        assert_eq!(
+            hand1.check_flush(),
+            Some(HandRanking::StraightFlush(Rank::Five))
+        );
+        let hand2 = Hand::new(&hole2, &board);
+        assert_eq!(hand2.check_flush(), Some(HandRanking::RoyalFlush));
     }
 
     #[test]
@@ -429,10 +586,7 @@ mod tests {
         ];
 
         let hand = Hand::new(&hole, &board);
-        assert_eq!(
-            hand.check_straight(None),
-            Some(HandRanking::Straight(Rank::Five))
-        );
+        assert_eq!(hand.best(), HandRanking::Straight(Rank::Five));
     }
 
     #[test]
@@ -471,10 +625,7 @@ mod tests {
         ];
 
         let hand = Hand::new(&hole, &board);
-        assert_eq!(
-            hand.check_quads(),
-            Some(HandRanking::Quads(Rank::King, Rank::Nine))
-        );
+        assert_eq!(hand.best(), HandRanking::Quads(Rank::King, Rank::Nine));
     }
 
     #[test]
@@ -513,10 +664,7 @@ mod tests {
         ];
 
         let hand = Hand::new(&hole, &board);
-        assert_eq!(
-            hand.check_quads(),
-            Some(HandRanking::FullHouse(Rank::King, Rank::Two))
-        );
+        assert_eq!(hand.best(), HandRanking::FullHouse(Rank::King, Rank::Two));
     }
 
     #[test]
@@ -555,17 +703,14 @@ mod tests {
         ];
 
         let hand = Hand::new(&hole, &board);
-        assert_eq!(
-            hand.check_quads(),
-            Some(HandRanking::FullHouse(Rank::Two, Rank::Seven))
-        );
+        assert_eq!(hand.best(), HandRanking::FullHouse(Rank::Two, Rank::Seven));
     }
 
     #[test]
     fn check_set() {
-        let hole = [
+        let hole1 = [
             Card {
-                rank: Rank::Two,
+                rank: Rank::Ace,
                 suit: Suit::Hearts,
             },
             Card {
@@ -573,14 +718,24 @@ mod tests {
                 suit: Suit::Clubs,
             },
         ];
+        let hole2 = [
+            Card {
+                rank: Rank::Ace,
+                suit: Suit::Spades,
+            },
+            Card {
+                rank: Rank::Four,
+                suit: Suit::Clubs,
+            },
+        ];
         let board = [
             Card {
-                rank: Rank::Six,
+                rank: Rank::Ace,
                 suit: Suit::Diamonds,
             },
             Card {
-                rank: Rank::Two,
-                suit: Suit::Spades,
+                rank: Rank::Ace,
+                suit: Suit::Clubs,
             },
             Card {
                 rank: Rank::Eight,
@@ -596,11 +751,13 @@ mod tests {
             },
         ];
 
-        let hand = Hand::new(&hole, &board);
+        let hand1 = Hand::new(&hole1, &board);
+        let hand2 = Hand::new(&hole2, &board);
         assert_eq!(
-            hand.check_quads(),
-            Some(HandRanking::Set(Rank::Two, 0b01_0001_1010_0010))
+            hand1.best(),
+            HandRanking::Set(Rank::Ace, 0b01_0001_0000_0000)
         );
+        assert_eq!(hand1.best(), hand2.best());
     }
 
     #[test]
@@ -640,8 +797,8 @@ mod tests {
 
         let hand = Hand::new(&hole, &board);
         assert_eq!(
-            hand.check_quads(),
-            Some(HandRanking::TwoPair(Rank::Ace, Rank::Eight, Rank::Six))
+            hand.best(),
+            HandRanking::TwoPair(Rank::Ace, Rank::Eight, Rank::Six)
         );
     }
 
@@ -682,8 +839,8 @@ mod tests {
 
         let hand = Hand::new(&hole, &board);
         assert_eq!(
-            hand.check_quads(),
-            Some(HandRanking::OnePair(Rank::Ace, 0b10_0001_1010_1100))
+            hand.best(),
+            HandRanking::OnePair(Rank::Ace, 0b00_0001_1010_0000)
         );
     }
 
@@ -723,9 +880,6 @@ mod tests {
         ];
 
         let hand = Hand::new(&hole, &board);
-        assert_eq!(
-            hand.check_quads(),
-            Some(HandRanking::HighCard(0b11_0001_1010_1100))
-        );
+        assert_eq!(hand.best(), HandRanking::HighCard(0b11_0001_1010_0000));
     }
 }
